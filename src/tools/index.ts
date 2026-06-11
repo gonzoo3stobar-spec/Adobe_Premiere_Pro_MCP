@@ -515,11 +515,11 @@ export class PremiereProTools {
       // Export and Rendering
       {
         name: 'export_sequence',
-        description: 'Renders and exports a sequence to a video file. This is for creating the final video.',
+        description: 'Renders and exports a sequence to a video file directly inside Premiere Pro (synchronous: blocks until the render finishes, then verifies the output file on disk). This is for creating the final video. Long renders need the updated CEP bridge panel, which honors extended per-command timeouts; as fallback for very long sequences use add_to_render_queue.',
         inputSchema: z.object({
           sequenceId: z.string().describe('The ID of the sequence to export'),
           outputPath: z.string().describe('The absolute path where the final video file will be saved'),
-          presetPath: z.string().optional().describe('Optional path to an export preset file (.epr) for specific settings'),
+          presetPath: z.string().optional().describe('Path to an export preset file (.epr). Required in practice — format names like "H.264" are not accepted.'),
           format: z.enum(['mp4', 'mov', 'avi', 'h264', 'prores']).optional().describe('The export format or codec'),
           quality: z.enum(['low', 'medium', 'high', 'maximum']).optional().describe('Export quality setting'),
           resolution: z.string().optional().describe('Export resolution (e.g., "1920x1080", "3840x2160")')
@@ -726,12 +726,12 @@ export class PremiereProTools {
       // Render Queue
       {
         name: 'add_to_render_queue',
-        description: 'Adds a sequence to the Adobe Media Encoder render queue.',
+        description: 'Adds a sequence to the Adobe Media Encoder render queue (asynchronous render in AME). Known issue: Premiere 26.x has been observed to ignore the requested output path and render to the system temp folder as <project name>.mp4 — see KNOWN_ISSUES.md. Use export_sequence when the exact output path matters.',
         inputSchema: z.object({
           sequenceId: z.string().describe('The ID of the sequence to render'),
-          outputPath: z.string().describe('Output file path'),
-          presetPath: z.string().optional().describe('Export preset file path'),
-          startImmediately: z.boolean().optional().describe('Whether to start rendering immediately (default: false)')
+          outputPath: z.string().describe('Output file path (may be ignored by Premiere 26.x — see tool description)'),
+          presetPath: z.string().optional().describe('Path to an export preset file (.epr). Required in practice.'),
+          startImmediately: z.boolean().optional().describe('Whether to start the AME batch immediately (default: false)')
         })
       },
       {
@@ -3933,35 +3933,39 @@ export class PremiereProTools {
   }
 
   // Export and Rendering Implementation
+  // Adobe's export APIs expect an absolute path to a .epr preset file. Passing a
+  // string name like "H.264" silently fails. Reject early with a clear error
+  // rather than letting the user think an export happened.
+  private presetPathRequiredError(extra: Record<string, unknown>): any {
+    return {
+      success: false,
+      error: 'presetPath required — must be absolute path to a .epr preset file (Adobe export APIs do not accept format names like "H.264" or "ProRes")',
+      hint: 'Create the preset in AME UI: File → Export Settings → configure → Save Preset, or use a preset shipped with Premiere, e.g. <install>/Settings/IngestPresets/Transcode/Match Source - H.264 High Bitrate.epr.',
+      ...extra,
+    };
+  }
+
   private async exportSequence(sequenceId: string, outputPath: string, presetPath?: string, format?: string, quality?: string, resolution?: string): Promise<any> {
-    // app.encoder.encodeSequence() expects an absolute path to a .epr preset file.
-    // Passing a string name like "H.264" silently fails: encodeSequence returns
-    // no jobID and the JSX bridge reports {success:false}. Reject early with a
-    // clear error rather than letting the user think a queue happened.
     if (!presetPath) {
-      return {
-        success: false,
-        error: 'presetPath required — must be absolute path to a .epr preset file (Adobe encodeSequence does not accept format names like "H.264" or "ProRes")',
-        hint: 'Create the preset in AME UI: File → Export Settings → configure → Save Preset → exports to ~/Library/Application Support/Adobe/Common/AME/<version>/Presets/. Pass that .epr path as presetPath.',
-        sequenceId,
-        outputPath,
-        format,
-        quality,
-        resolution,
-      };
+      return this.presetPathRequiredError({ sequenceId, outputPath, format, quality, resolution });
     }
 
     try {
-      // bridge.renderSequence returns a structured response; propagate it instead
-      // of unconditionally claiming success. Pre-fix wrapper reported success even
-      // when AME never received the job (false-success false positives).
-      const result = await this.bridge.renderSequence(sequenceId, outputPath, presetPath);
+      // Direct in-app render (sequence.exportAsMediaDirect). app.encoder.encodeSequence
+      // is NOT used here: besides rejecting forward-slash paths, Premiere 26.x ignores
+      // its output-path argument and renders to the system temp folder instead
+      // (confirmed live on Windows, June 11 2026). The bridge verifies the output
+      // file on disk (with retry) before reporting success.
+      const result = await this.bridge.exportSequenceDirect(sequenceId, outputPath, presetPath);
 
-      if (result && result.success === false) {
+      if (!result || result.success !== true) {
         return {
           ...result,
+          success: false,
+          error: result?.error || 'Export failed without a bridge error message',
           sequenceId,
           outputPath,
+          presetPath,
           format,
           quality,
           resolution,
@@ -3970,24 +3974,27 @@ export class PremiereProTools {
 
       return {
         success: true,
-        message: 'Sequence queued in Adobe Media Encoder. Render runs asynchronously — verify by checking the output file size growth.',
+        message: 'Sequence exported and output file verified on disk.',
         sequenceId,
-        outputPath,
+        outputPath: result.outputPath ?? outputPath,
+        fileSizeBytes: result.fileSizeBytes,
         presetPath,
         format,
         quality,
         resolution,
-        jobID: result?.jobID,
-        queued: result?.queued,
-        verify: `ffprobe -show_entries format=duration,size '${outputPath}'`,
       };
     } catch (error) {
-      return {
+      const message = error instanceof Error ? error.message : String(error);
+      const response: any = {
         success: false,
-        error: `Failed to export sequence: ${error instanceof Error ? error.message : String(error)}`,
+        error: `Failed to export sequence: ${message}`,
         sequenceId,
         outputPath,
       };
+      if (/time(d)? ?out/i.test(message)) {
+        response.hint = 'Direct export blocks Premiere until the render finishes and the bridge stopped waiting — the export may still be running. Check whether the output file appears and grows. Long renders need the updated CEP bridge panel (reload it), which honors extended per-command timeouts.';
+      }
+      return response;
     }
   }
 
@@ -4777,8 +4784,48 @@ export class PremiereProTools {
   }
 
   // Render Queue
-  private async addToRenderQueue(sequenceId: string, outputPath: string, presetPath?: string, _startImmediately?: boolean): Promise<any> {
-    return await this.exportSequence(sequenceId, outputPath, presetPath);
+  private async addToRenderQueue(sequenceId: string, outputPath: string, presetPath?: string, startImmediately?: boolean): Promise<any> {
+    if (!presetPath) {
+      return this.presetPathRequiredError({ sequenceId, outputPath, startImmediately });
+    }
+
+    try {
+      // Unlike export_sequence (direct in-app render), this goes through
+      // app.encoder.encodeSequence so the render runs asynchronously in AME.
+      const result = await this.bridge.renderSequence(sequenceId, outputPath, presetPath, startImmediately === true);
+
+      if (!result || result.success !== true) {
+        return {
+          ...result,
+          success: false,
+          error: result?.error || 'Queueing failed without a bridge error message',
+          sequenceId,
+          outputPath,
+          presetPath,
+        };
+      }
+
+      return {
+        success: true,
+        message: startImmediately === true
+          ? 'Sequence queued in Adobe Media Encoder and batch render started. Rendering is asynchronous — verify the output file once AME finishes.'
+          : 'Sequence queued in Adobe Media Encoder. Start the queue in AME, or pass startImmediately: true.',
+        jobID: result.jobID,
+        queued: true,
+        batchStarted: result.batchStarted,
+        warning: result.warning,
+        sequenceId,
+        outputPath: result.outputPath ?? outputPath,
+        presetPath,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to add to render queue: ${error instanceof Error ? error.message : String(error)}`,
+        sequenceId,
+        outputPath,
+      };
+    }
   }
 
   private async getRenderQueueStatus(): Promise<any> {

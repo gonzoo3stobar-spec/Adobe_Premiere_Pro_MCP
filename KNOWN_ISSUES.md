@@ -32,6 +32,24 @@ Current behavior:
 - the tool is still exposed
 - it returns an error explaining that render queue monitoring requires Adobe Media Encoder
 
+### `add_to_render_queue`: Premiere 26.x ignores the requested output path
+
+Status: confirmed Premiere regression (live on Windows 11, Premiere Pro 26.2.2, June 12, 2026)
+
+`app.encoder.encodeSequence()` accepts the job (returns a jobID) and AME renders it
+successfully, but the rendered file lands in the system temp folder as
+`<project name>.mp4` / `<project name>_N.mp4` instead of at the requested output path.
+Every parameter variant was live-tested and behaves identically: 5-arg and 6-arg
+signatures, numeric and boolean `removeOnCompletion`/`startQueueImmediately`, output
+paths with and without extension, `ENCODE_ENTIRE` constant vs literal `0`.
+
+Current behavior:
+
+- the tool still queues the job (that part works) and returns the jobID
+- the response carries an explicit `warning` about the output location
+- use `export_sequence` (direct in-app render, output verified on disk) whenever the
+  exact output path matters
+
 ## Operational Limits
 
 These are not hidden bugs; they are boundaries of the current architecture.
@@ -80,6 +98,20 @@ Use a scratch project if you do not want those fixtures in a working edit.
 ## Recently Fixed
 
 These issues were real and are now resolved in the current code:
+
+- `export_sequence` and `add_to_render_queue` always failed with `encodeSequence threw:
+  Error: Unknown error exception` (confirmed live on Windows, June 11, 2026). Root cause:
+  Premiere's encoder APIs reject forward-slash paths on Windows — both tools now convert
+  output and preset paths to native form via `File.fsName` inside ExtendScript.
+  `export_sequence` additionally switched from `app.encoder.encodeSequence` to
+  `sequence.exportAsMediaDirect` (no AME dependency, synchronous) and only reports
+  success after verifying the output file exists non-empty on disk (same policy as
+  `export_frame`); `add_to_render_queue` is now a real AME queue path with preset
+  existence check, AME boot retry, and a wired-up `startImmediately` flag
+- the CEP bridge panel cut off every command at a hard 45s, which direct sequence
+  exports can exceed. The MCP server now sends a per-command `timeoutMs` in the command
+  file and the panel honors it (clamped to 15 minutes). Reload the panel
+  (`Window > Extensions > MCP Bridge (CEP)`, right-click → Reload) after updating
 
 - bridge script validation was incorrectly rejecting valid ExtendScript
 - `import_media` could import successfully but fail to locate the new project item

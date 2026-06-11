@@ -255,7 +255,7 @@ export class PremiereProBridge implements PremiereProTransport {
     return EXTENDSCRIPT_HELPERS + '(function(){\n' + script + '\n})();';
   }
 
-  async executeScript(script: string): Promise<any> {
+  async executeScript(script: string, timeoutMs = 60000): Promise<any> {
     if (!this.isInitialized) {
       throw new Error('Bridge not initialized. Call initialize() first.');
     }
@@ -267,15 +267,20 @@ export class PremiereProBridge implements PremiereProTransport {
     try {
       const fullScript = this.buildExecutableScript(script);
 
-      // Write command to file
+      // Write command to file. timeoutMs lets the CEP panel extend its own
+      // evalScript guard for long-running commands (e.g. direct sequence
+      // export); older panels ignore the field and keep their 45s default.
       await fs.writeFile(commandFile, JSON.stringify({
         id: commandId,
         script: fullScript,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        timeoutMs
       }));
 
-      // Wait for response (in a real implementation, this would be handled by the UXP plugin)
-      const response = await this.waitForResponse(responseFile);
+      // Wait for response (in a real implementation, this would be handled by the UXP plugin).
+      // Wait slightly longer than the panel's own guard so its timeout error
+      // reaches us instead of racing our local deadline.
+      const response = await this.waitForResponse(responseFile, timeoutMs + 15000);
       
       // Clean up files
       await fs.unlink(commandFile).catch(() => {});
@@ -695,7 +700,7 @@ export class PremiereProBridge implements PremiereProTransport {
     return await this.executeScript(script);
   }
 
-  async renderSequence(sequenceId: string, outputPath: string, presetPath: string): Promise<any> {
+  async renderSequence(sequenceId: string, outputPath: string, presetPath: string, startImmediately = true): Promise<any> {
     // Escape backslashes and quotes in paths so JSX string-eval is safe
     const safePath = escapeExtendScriptString;
     const script = `
@@ -712,39 +717,72 @@ export class PremiereProBridge implements PremiereProTransport {
           return JSON.stringify({ success: false, error: "app.encoder not available in this Premiere build" });
         }
 
+        var presetFile = new File("${safePath(presetPath)}");
+        if (!presetFile.exists) {
+          return JSON.stringify({ success: false, error: "Preset file not found: " + presetFile.fsName });
+        }
+
+        var outputFile = new File("${safePath(outputPath)}");
+        if (outputFile.parent && !outputFile.parent.exists) {
+          try { outputFile.parent.create(); } catch (eDir) {}
+        }
+
         // Boot AME if not already running so it can pick up the queue
         try { app.encoder.launchEncoder(); } catch (e1) {}
 
         // Queue range constants on app.encoder: ENCODE_ENTIRE / ENCODE_IN_TO_OUT / ENCODE_WORKAREA
         var range = (typeof app.encoder.ENCODE_ENTIRE !== "undefined") ? app.encoder.ENCODE_ENTIRE : 0;
 
+        // The encoder API rejects forward-slash paths on Windows with
+        // "Unknown error exception" (confirmed live, Premiere 26.2.2) — always
+        // hand it native File.fsName paths.
+        // launchEncoder() returns before AME is actually ready and encodeSequence
+        // throws while AME is still booting, so retry a few times before giving up.
         // 5th arg "removeOnCompletion": 1=remove, 0=keep. We use 1 to avoid AME queue clutter.
-        var jobID = app.encoder.encodeSequence(
-          sequence,
-          "${safePath(outputPath)}",
-          "${safePath(presetPath)}",
-          range,
-          1
-        );
+        var jobID = null;
+        var encodeError = null;
+        for (var attempt = 0; attempt < 4; attempt++) {
+          encodeError = null;
+          try {
+            jobID = app.encoder.encodeSequence(
+              sequence,
+              outputFile.fsName,
+              presetFile.fsName,
+              range,
+              1
+            );
+          } catch (e2) {
+            encodeError = e2.toString();
+          }
+          if (jobID) break;
+          $.sleep(2000);
+        }
 
         if (!jobID) {
           return JSON.stringify({
             success: false,
-            error: "encodeSequence returned no jobID — preset path may be invalid or AME not connected",
-            outputPath: "${safePath(outputPath)}",
-            presetPath: "${safePath(presetPath)}"
+            error: encodeError
+              ? "encodeSequence threw: " + encodeError
+              : "encodeSequence returned no jobID — preset path may be invalid or AME not connected",
+            outputPath: outputFile.fsName,
+            presetPath: presetFile.fsName
           });
         }
 
         // Trigger AME to actually start processing the queued job
-        try { app.encoder.startBatch(); } catch (e2) {}
+        var batchStarted = false;
+        if (${startImmediately}) {
+          try { app.encoder.startBatch(); batchStarted = true; } catch (e3) {}
+        }
 
         return JSON.stringify({
           success: true,
           queued: true,
           jobID: String(jobID),
-          outputPath: "${safePath(outputPath)}",
-          presetPath: "${safePath(presetPath)}"
+          batchStarted: batchStarted,
+          outputPath: outputFile.fsName,
+          presetPath: presetFile.fsName,
+          warning: "Premiere 26.x has been observed to ignore the requested output path for AME jobs and render to the system temp folder as <project name>.mp4 instead — verify the output location (see KNOWN_ISSUES.md). Use export_sequence when the exact output path matters."
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: "encodeSequence threw: " + e.toString() });
@@ -754,6 +792,88 @@ export class PremiereProBridge implements PremiereProTransport {
     const raw = await this.executeScript(script);
     // CEP returns the JSON.stringify'd object; bridge.executeScript returns parsed.result if present.
     // Some CEP plugins wrap as string; handle both.
+    if (typeof raw === "string") {
+      try { return JSON.parse(raw); } catch { return { success: false, error: "Bridge returned unparseable string: " + raw }; }
+    }
+    return raw;
+  }
+
+  async exportSequenceDirect(sequenceId: string, outputPath: string, presetPath: string, workAreaType = 0): Promise<any> {
+    const safePath = escapeExtendScriptString;
+    const script = `
+      try {
+        var sequence = __findSequence("${escapeExtendScriptString(sequenceId)}");
+        if (!sequence) {
+          return JSON.stringify({ success: false, error: "Sequence not found by id: ${escapeExtendScriptString(sequenceId)}" });
+        }
+        if (typeof sequence.exportAsMediaDirect !== "function") {
+          return JSON.stringify({ success: false, error: "exportAsMediaDirect not available in this Premiere build" });
+        }
+
+        var presetFile = new File("${safePath(presetPath)}");
+        if (!presetFile.exists) {
+          return JSON.stringify({ success: false, error: "Preset file not found: " + presetFile.fsName });
+        }
+
+        var outputFile = new File("${safePath(outputPath)}");
+        if (outputFile.parent && !outputFile.parent.exists) {
+          try { outputFile.parent.create(); } catch (eDir) {}
+        }
+        // Remove a stale file so the existence check below cannot report a
+        // previous export as success.
+        if (outputFile.exists) {
+          try { outputFile.remove(); } catch (eRm) {}
+        }
+
+        // The encoder API rejects forward-slash paths on Windows with
+        // "Unknown error exception" (confirmed live, Premiere 26.2.2) — always
+        // hand it native File.fsName paths.
+        var returnValue = null;
+        try {
+          returnValue = sequence.exportAsMediaDirect(outputFile.fsName, presetFile.fsName, ${workAreaType});
+        } catch (eX) {
+          return JSON.stringify({
+            success: false,
+            error: "exportAsMediaDirect threw: " + eX.toString(),
+            outputPath: outputFile.fsName,
+            presetPath: presetFile.fsName
+          });
+        }
+
+        // A non-throwing call is NOT success — only an existing, non-empty
+        // output file counts (same policy as export_frame).
+        var check = new File("${safePath(outputPath)}");
+        var written = false;
+        for (var w = 0; w < 25; w++) {
+          if (check.exists && check.length > 0) { written = true; break; }
+          $.sleep(200);
+        }
+
+        if (!written) {
+          return JSON.stringify({
+            success: false,
+            error: "exportAsMediaDirect returned '" + String(returnValue) + "' but no file was written to: " + check.fsName,
+            returnValue: String(returnValue),
+            outputPath: check.fsName
+          });
+        }
+
+        return JSON.stringify({
+          success: true,
+          verified: true,
+          outputPath: check.fsName,
+          fileSizeBytes: check.length,
+          returnValue: String(returnValue)
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: "exportAsMediaDirect threw: " + e.toString() });
+      }
+    `;
+
+    // Direct export blocks Premiere's scripting host until the render finishes,
+    // so give the bridge far more than the default 60s. The CEP panel honors the
+    // per-command timeoutMs field (older panels still cut off at their own 45s).
+    const raw = await this.executeScript(script, 600000);
     if (typeof raw === "string") {
       try { return JSON.parse(raw); } catch { return { success: false, error: "Bridge returned unparseable string: " + raw }; }
     }

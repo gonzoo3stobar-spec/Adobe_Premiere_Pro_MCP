@@ -584,11 +584,14 @@ describe('PremiereProTools', () => {
   });
 
   describe('export_sequence', () => {
-    // Pre-fix bugs (commit 6 of PR #14):
+    // Pre-fix bugs:
     //   1. Wrapper accepted no presetPath and silently substituted "H.264" / "ProRes"
-    //      string literals — Adobe encodeSequence requires absolute .epr path.
-    //   2. Wrapper unconditionally returned {success:true} even when bridge.renderSequence
-    //      reported {success:false} — false-positive that hid AME-never-received errors.
+    //      string literals — Adobe export APIs require an absolute .epr path.
+    //   2. Wrapper routed through app.encoder.encodeSequence, which rejects
+    //      forward-slash paths on Windows ("Unknown error exception") and in
+    //      Premiere 26.x ignores the output path entirely (renders to %TEMP%).
+    //      export_sequence now uses sequence.exportAsMediaDirect via
+    //      bridge.exportSequenceDirect, which verifies the output file on disk.
 
     it('rejects calls without presetPath instead of substituting a string literal', async () => {
       const result = await tools.executeTool('export_sequence', {
@@ -599,7 +602,7 @@ describe('PremiereProTools', () => {
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/presetPath required/);
       expect(result.hint).toMatch(/\.epr/);
-      expect(mockBridge.renderSequence).not.toHaveBeenCalled();
+      expect(mockBridge.exportSequenceDirect).not.toHaveBeenCalled();
     });
 
     it('rejects calls without presetPath even when format is "mp4" (no H.264 fallback)', async () => {
@@ -612,15 +615,14 @@ describe('PremiereProTools', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/presetPath required/);
-      expect(mockBridge.renderSequence).not.toHaveBeenCalled();
+      expect(mockBridge.exportSequenceDirect).not.toHaveBeenCalled();
     });
 
     it('propagates bridge {success:false} response instead of claiming success', async () => {
-      mockBridge.renderSequence.mockResolvedValue({
+      mockBridge.exportSequenceDirect.mockResolvedValue({
         success: false,
-        error: 'encodeSequence returned no jobID — preset path may be invalid or AME not connected',
+        error: "exportAsMediaDirect returned 'No Error' but no file was written to: /tmp/out.mp4",
         outputPath: '/tmp/out.mp4',
-        presetPath: '/path/that/does/not/exist.epr',
       });
 
       const result = await tools.executeTool('export_sequence', {
@@ -630,18 +632,41 @@ describe('PremiereProTools', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toMatch(/encodeSequence returned no jobID/);
+      expect(result.error).toMatch(/no file was written/);
       expect(result.sequenceId).toBe('seq-1');
     });
 
-    it('returns success with jobID when bridge confirms AME queue accepted', async () => {
-      mockBridge.renderSequence.mockResolvedValue({
+    it('returns success only after the bridge verified the output file on disk', async () => {
+      mockBridge.exportSequenceDirect.mockResolvedValue({
         success: true,
-        queued: true,
-        jobID: 'job-abc-123',
-        outputPath: '/tmp/out.mp4',
-        presetPath: '/Users/me/preset.epr',
+        verified: true,
+        outputPath: 'D:\\exports\\out.mp4',
+        fileSizeBytes: 2364144,
+        returnValue: 'No Error',
       });
+
+      const result = await tools.executeTool('export_sequence', {
+        sequenceId: 'seq-1',
+        outputPath: 'D:/exports/out.mp4',
+        presetPath: 'C:/presets/h264.epr',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.message).toMatch(/verified on disk/);
+      expect(result.outputPath).toBe('D:\\exports\\out.mp4');
+      expect(result.fileSizeBytes).toBe(2364144);
+      expect(mockBridge.exportSequenceDirect).toHaveBeenCalledWith(
+        'seq-1',
+        'D:/exports/out.mp4',
+        'C:/presets/h264.epr',
+      );
+      expect(mockBridge.renderSequence).not.toHaveBeenCalled();
+    });
+
+    it('reports an honest failure with a hint when the bridge times out mid-render', async () => {
+      mockBridge.exportSequenceDirect.mockRejectedValue(
+        new Error('Bridge response timeout. Ensure Premiere Pro is open...'),
+      );
 
       const result = await tools.executeTool('export_sequence', {
         sequenceId: 'seq-1',
@@ -649,21 +674,16 @@ describe('PremiereProTools', () => {
         presetPath: '/Users/me/preset.epr',
       });
 
-      expect(result.success).toBe(true);
-      expect(result.jobID).toBe('job-abc-123');
-      expect(result.queued).toBe(true);
-      expect(result.message).toMatch(/queued in Adobe Media Encoder/);
-      expect(mockBridge.renderSequence).toHaveBeenCalledWith(
-        'seq-1',
-        '/tmp/out.mp4',
-        '/Users/me/preset.epr',
-      );
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/timeout/i);
+      expect(result.hint).toMatch(/may still be running/);
     });
   });
 
   describe('add_to_render_queue', () => {
-    // add_to_render_queue delegates to exportSequence — same fixes apply transitively.
-    it('rejects calls without presetPath (delegates to exportSequence guard)', async () => {
+    // No longer delegates to exportSequence: this is the real AME queue path
+    // (app.encoder.encodeSequence) with the startImmediately flag wired through.
+    it('rejects calls without presetPath', async () => {
       const result = await tools.executeTool('add_to_render_queue', {
         sequenceId: 'seq-1',
         outputPath: '/tmp/out.mp4',
@@ -674,7 +694,7 @@ describe('PremiereProTools', () => {
       expect(mockBridge.renderSequence).not.toHaveBeenCalled();
     });
 
-    it('propagates bridge failure responses through the delegation', async () => {
+    it('propagates bridge failure responses', async () => {
       mockBridge.renderSequence.mockResolvedValue({
         success: false,
         error: 'app.encoder not available in this Premiere build',
@@ -688,6 +708,61 @@ describe('PremiereProTools', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toMatch(/app.encoder not available/);
+    });
+
+    it('queues via the AME path and passes startImmediately through', async () => {
+      mockBridge.renderSequence.mockResolvedValue({
+        success: true,
+        queued: true,
+        jobID: 'job-abc-123',
+        batchStarted: true,
+        outputPath: 'D:\\exports\\out.mp4',
+        warning: 'Premiere 26.x has been observed to ignore the requested output path...',
+      });
+
+      const result = await tools.executeTool('add_to_render_queue', {
+        sequenceId: 'seq-1',
+        outputPath: '/tmp/out.mp4',
+        presetPath: '/Users/me/preset.epr',
+        startImmediately: true,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.jobID).toBe('job-abc-123');
+      expect(result.queued).toBe(true);
+      expect(result.batchStarted).toBe(true);
+      expect(result.warning).toMatch(/output path/);
+      expect(result.message).toMatch(/queued in Adobe Media Encoder/);
+      expect(mockBridge.renderSequence).toHaveBeenCalledWith(
+        'seq-1',
+        '/tmp/out.mp4',
+        '/Users/me/preset.epr',
+        true,
+      );
+    });
+
+    it('defaults startImmediately to false when omitted', async () => {
+      mockBridge.renderSequence.mockResolvedValue({
+        success: true,
+        queued: true,
+        jobID: 'job-1',
+        batchStarted: false,
+      });
+
+      const result = await tools.executeTool('add_to_render_queue', {
+        sequenceId: 'seq-1',
+        outputPath: '/tmp/out.mp4',
+        presetPath: '/Users/me/preset.epr',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.message).toMatch(/Start the queue in AME/);
+      expect(mockBridge.renderSequence).toHaveBeenCalledWith(
+        'seq-1',
+        '/tmp/out.mp4',
+        '/Users/me/preset.epr',
+        false,
+      );
     });
   });
 

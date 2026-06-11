@@ -232,10 +232,10 @@
                 return;
             }
             done({ success: true, result: result, timestamp: new Date().toISOString() });
-        });
+        }, command.timeoutMs);
     };
 
-    MCPPremiereBridge.prototype.executeExtendScript = function(script, callback) {
+    MCPPremiereBridge.prototype.executeExtendScript = function(script, callback, timeoutMs) {
         var self = this;
         try {
             if (!this.csInterface) {
@@ -252,7 +252,13 @@
 
             var fullScript = EXTENDSCRIPT_COMPAT_HELPERS + '\n' + script;
             var settled = false;
-            var timeoutMs = 45000;
+            // Long-running commands (direct sequence export blocks until the
+            // render finishes) may request more time via the command file;
+            // clamp so a bad value can never hang the queue indefinitely.
+            timeoutMs = parseInt(timeoutMs, 10);
+            if (!isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = 45000;
+            if (timeoutMs < 5000) timeoutMs = 5000;
+            if (timeoutMs > 900000) timeoutMs = 900000;
             var timeoutId = setTimeout(function() {
                 if (settled) return;
                 settled = true;
