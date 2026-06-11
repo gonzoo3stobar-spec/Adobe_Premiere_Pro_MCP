@@ -2,11 +2,17 @@
 
 This file tracks current, confirmed limits. It is no longer a backlog of already-fixed prototype bugs.
 
-## Current State (May 16, 2026)
+## Current State (June 12, 2026)
 
 The current built tool catalog exposes:
 
-- `104` tools
+- `107` tools
+
+New since June 12, 2026 (unit-tested and built, live sweep against a scratch project still pending):
+
+- `place_clip_segment` — places a source range (sourceIn–sourceOut) of a project item on a track in one call (temporary project-item in/out points + overwrite/insert, with on-timeline verification). Replaces the park-beyond-sequence-end → razor twice → lift → move staging recipe.
+- `ripple_delete_range` — multi-track ripple delete: razors all tracks at both range boundaries, lifts everything inside the range, shifts all later clips left in one ExtendScript pass (100+ clips per call), optionally shifts sequence markers.
+- `get_track_clips` — single-track clip listing (id, name, start, end, duration, inPoint, outPoint) with optional time window, instead of a full list_sequence_tracks dump.
 
 The last broad live sweep in this repository was run on March 4, 2026:
 
@@ -77,6 +83,23 @@ Fix:
 
 Use a scratch project if you do not want those fixtures in a working edit.
 
+### Do not switch projects through the bridge
+
+Calling `app.openDocument()` to activate an already-open second project is unreliable (observed live on Windows, Premiere 26.2.2, June 12, 2026): the switch initially verified as successful, but the next `createNewSequence` call stalled the ExtendScript host for 45+ seconds and the session ended with the second project closed and the original project active again.
+
+Practical consequence:
+
+- live tests must be run with the scratch project already open and ACTIVE in Premiere (manual switch)
+- bridge scripts should verify `app.project.path` before mutating and abort on mismatch instead of trying to activate a different project
+
+### Locale-dependent effect and transition names
+
+Effect/transition lookups go through QE by display name, which is localized. On a German installation, `Cross Dissolve` does not exist — the bridge reports fake success or a silent no-op for transitions and some effects addressed by their English names (confirmed live June 11, 2026: `Constant Power` failed silently; `Konstante Leistung`, `Weiche Blende`, `Übergang zu Schwarz` worked).
+
+Workaround:
+
+- always query `list_available_transitions` / `list_available_audio_transitions` / `list_available_effects` first and use the returned names verbatim
+
 ## Recently Fixed
 
 These issues were real and are now resolved in the current code:
@@ -91,6 +114,8 @@ These issues were real and are now resolved in the current code:
 - ExtendScript string injection is now centralized: all tools that embed paths, names, or IDs in generated scripts go through `escapeExtendScriptString()` (backslashes, quotes, newlines), fixing the same path-corruption class of bug across the whole tool catalog
 - `remove_effect` was advertised even though actual removal is not supported and has been removed from the tool catalog
 - the branded workflow response returned the wrong message due to object spread order
+- `razor_timeline_at_time` razored ALL tracks of the omitted type when only one of `videoTrackIndices`/`audioTrackIndices` was provided (live-confirmed June 11, 2026 and reported as "razor ignores the track parameters"). Restricting one track type now leaves the other type uncut; omitting both arrays still cuts everything. Note that razoring linked clips still cuts the linked counterpart — that is Premiere's linking behavior, not track selection
+- `move_clip` accepted `newTrackIndex` but silently ignored it (clips always stayed on their track, live-confirmed June 11, 2026). Premiere's scripting DOM has no track-move call, so a differing `newTrackIndex` now fails honestly with a pointer to `place_clip_segment` + `remove_from_timeline`. The time-move path also verifies the clip actually landed at the requested position instead of always reporting success
 
 ## Release Guidance
 

@@ -29,6 +29,9 @@ describe('PremiereProTools', () => {
       expect(toolNames).toContain('build_brand_spot_from_mogrt_and_assets');
       expect(toolNames).toContain('import_media');
       expect(toolNames).toContain('add_to_timeline');
+      expect(toolNames).toContain('place_clip_segment');
+      expect(toolNames).toContain('ripple_delete_range');
+      expect(toolNames).toContain('get_track_clips');
       expect(toolNames).toContain('import_mogrt');
       expect(toolNames).toContain('setup_ducking');
       expect(toolNames).not.toContain('create_nested_sequence');
@@ -263,6 +266,37 @@ describe('PremiereProTools', () => {
       expect(result.cutAudioTracks).toEqual([0, 2, 3]);
     });
 
+    it('does not razor audio tracks when only videoTrackIndices is provided', async () => {
+      // Pre-fix: the omitted track-type array defaulted to "all tracks", so a caller
+      // restricting the cut to one video track still razored every audio track
+      // (live-confirmed June 11, 2026 as "razor ignores the track parameters").
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('razor_timeline_at_time', {
+        sequenceId: 'seq-123',
+        time: 5,
+        videoTrackIndices: [1]
+      });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var requestedVideo = [1];');
+      expect(script).toContain('var requestedAudio = [];');
+    });
+
+    it('still razors all tracks when both index arrays are omitted', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('razor_timeline_at_time', {
+        sequenceId: 'seq-123',
+        time: 5
+      });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var requestedVideo = null;');
+      expect(script).toContain('var requestedAudio = null;');
+      expect(script).toContain('if (requested === null)');
+    });
+
     it('validates crop_clip bounds before calling the bridge', async () => {
       const result = await tools.executeTool('crop_clip', {
         clipId: 'clip-123',
@@ -357,6 +391,317 @@ describe('PremiereProTools', () => {
       expect(result.success).toBe(true);
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('__findClip("clip-123", "seq-456")'));
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('var isRipple = "lift" === "ripple";'));
+    });
+  });
+
+  describe('move_clip', () => {
+    it('fails honestly when newTrackIndex differs from the current track instead of silently ignoring it', async () => {
+      mockBridge.executeScript.mockResolvedValue({
+        success: false,
+        error: "move_clip cannot move clips across tracks: Premiere's scripting API has no track-move call (TrackItem.move only shifts in time). The clip stays on video track 1.",
+        hint: 'Use place_clip_segment to place the same source range on the target track, then remove_from_timeline for the original clip.'
+      });
+
+      const result = await tools.executeTool('move_clip', {
+        clipId: 'clip-123',
+        newTime: 10,
+        newTrackIndex: 3
+      });
+
+      expect(result.success).toBe(false);
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('if (3 !== info.trackIndex)');
+      expect(script).toContain('cannot move clips across tracks');
+      expect(script).toContain('place_clip_segment');
+    });
+
+    it('omits the cross-track guard when no newTrackIndex is given', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('move_clip', {
+        clipId: 'clip-123',
+        newTime: 10
+      });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).not.toContain('cannot move clips across tracks');
+    });
+
+    it('verifies the clip actually landed at the requested time', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('move_clip', {
+        clipId: 'clip-123',
+        newTime: 42.5
+      });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var actualTime = clip.start.seconds;');
+      expect(script).toContain('Math.abs(actualTime - 42.5) > 0.1');
+      expect(script).toContain('did not move the clip');
+    });
+  });
+
+  describe('place_clip_segment', () => {
+    const baseArgs = {
+      sequenceId: 'seq-1',
+      projectItemId: 'item-9',
+      trackIndex: 2,
+      trackType: 'video',
+      time: 12.5,
+      sourceIn: 3,
+      sourceOut: 7.25
+    };
+
+    it('rejects sourceOut <= sourceIn before calling the bridge', async () => {
+      const result = await tools.executeTool('place_clip_segment', {
+        ...baseArgs,
+        sourceIn: 5,
+        sourceOut: 5
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('sourceOut');
+      expect(mockBridge.executeScript).not.toHaveBeenCalled();
+    });
+
+    it('sets temporary source in/out points and places via overwriteClip in one script', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', baseArgs);
+
+      expect(mockBridge.executeScript).toHaveBeenCalledTimes(1);
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('projectItem.setInPoint(__secondsToTicks(3), 4);');
+      expect(script).toContain('projectItem.setOutPoint(__secondsToTicks(7.25), 4);');
+      expect(script).toContain('track.overwriteClip(projectItem, 12.5);');
+      expect(script).toContain('projectItem.clearInPoint(4);');
+      expect(script).toContain('projectItem.clearOutPoint(4);');
+    });
+
+    it('restores the original panel in/out points when clearing is unavailable', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', baseArgs);
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('originalIn = projectItem.getInPoint(4).ticks;');
+      expect(script).toContain('if (originalIn !== null) projectItem.setInPoint(originalIn, 4);');
+    });
+
+    it('uses insertClip when insertMode is insert', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', { ...baseArgs, insertMode: 'insert' });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('track.insertClip(projectItem, 12.5);');
+    });
+
+    it('verifies the placed track item and its source range instead of trusting the placement call', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', baseArgs);
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('did not produce a track item');
+      expect(script).toContain('source range does not match');
+      expect(script).toContain('Math.abs(placedClip.inPoint.seconds - 3) <= tolerance');
+    });
+
+    it('removes the auto-linked audio counterpart when linkAudio is false', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', { ...baseArgs, linkAudio: false });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var removeLinkedAudio = true;');
+    });
+
+    it('keeps the linked audio by default', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', baseArgs);
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var removeLinkedAudio = false;');
+    });
+
+    it('escapes quotes in injected ids', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('place_clip_segment', { ...baseArgs, sequenceId: 'seq-"quoted"' });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('seq-\\"quoted\\"');
+    });
+
+    it('passes through verified bridge failures', async () => {
+      mockBridge.executeScript.mockResolvedValue({
+        success: false,
+        error: 'Track item was placed but its source range does not match the requested segment (the full clip may have been placed instead)',
+        placed: true,
+        clipId: 'clip-77'
+      });
+
+      const result = await tools.executeTool('place_clip_segment', baseArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.placed).toBe(true);
+      expect(result.clipId).toBe('clip-77');
+    });
+  });
+
+  describe('ripple_delete_range', () => {
+    const baseArgs = {
+      sequenceId: 'seq-1',
+      startTime: 10,
+      endTime: 15
+    };
+
+    it('rejects endTime <= startTime before calling the bridge', async () => {
+      const result = await tools.executeTool('ripple_delete_range', {
+        ...baseArgs,
+        endTime: 10
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('endTime');
+      expect(mockBridge.executeScript).not.toHaveBeenCalled();
+    });
+
+    it('razors all tracks at both boundaries and shifts in a single bridge call', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('ripple_delete_range', baseArgs);
+
+      expect(mockBridge.executeScript).toHaveBeenCalledTimes(1);
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var startTime = 10;');
+      expect(script).toContain('var endTime = 15;');
+      expect(script).toContain('razorAll(toTimecode(startTime));');
+      expect(script).toContain('razorAll(toTimecode(endTime));');
+      expect(script).toContain('toShift.sort(function (x, y) { return x.start - y.start; });');
+      expect(script).toContain('.move(-delta)');
+      expect(script).toContain('processTracks(activeSequence.videoTracks, "V");');
+      expect(script).toContain('processTracks(activeSequence.audioTracks, "A");');
+    });
+
+    it('shifts markers by default and can be disabled', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('ripple_delete_range', baseArgs);
+      let script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var shiftMarkersEnabled = true;');
+
+      mockBridge.executeScript.mockClear();
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      await tools.executeTool('ripple_delete_range', { ...baseArgs, shiftMarkers: false });
+      script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var shiftMarkersEnabled = false;');
+    });
+
+    it('passes through partial-failure results with problem details', async () => {
+      mockBridge.executeScript.mockResolvedValue({
+        success: false,
+        error: 'Ripple delete only partially applied — the timeline may be in an inconsistent state. Use the undo tool to roll back.',
+        problems: [{ track: 'V1', start: 11, reason: 'remove failed: locked' }],
+        removedClips: 3,
+        shiftedClips: 40
+      });
+
+      const result = await tools.executeTool('ripple_delete_range', baseArgs);
+
+      expect(result.success).toBe(false);
+      expect(result.problems).toHaveLength(1);
+      expect(result.error).toContain('undo');
+    });
+
+    it('passes through successful results', async () => {
+      mockBridge.executeScript.mockResolvedValue({
+        success: true,
+        removedClips: 6,
+        shiftedClips: 162,
+        shiftedMarkers: 4,
+        clampedMarkers: 1,
+        delta: 5
+      });
+
+      const result = await tools.executeTool('ripple_delete_range', baseArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.shiftedClips).toBe(162);
+      expect(result.delta).toBe(5);
+    });
+  });
+
+  describe('get_track_clips', () => {
+    it('targets the requested track collection and returns source points per clip', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true, clips: [] });
+
+      await tools.executeTool('get_track_clips', {
+        sequenceId: 'seq-1',
+        trackType: 'audio',
+        trackIndex: 3
+      });
+
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('"audio" === "audio" ? sequence.audioTracks : sequence.videoTracks');
+      expect(script).toContain('var tracks = ');
+      expect(script).toContain('inPoint: clip.inPoint.seconds');
+      expect(script).toContain('outPoint: clip.outPoint.seconds');
+      expect(script).toContain('id: clip.nodeId');
+    });
+
+    it('injects the time window when provided and null when omitted', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true, clips: [] });
+
+      await tools.executeTool('get_track_clips', {
+        sequenceId: 'seq-1',
+        trackType: 'video',
+        trackIndex: 0,
+        fromTime: 30,
+        toTime: 90
+      });
+      let script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var fromTime = 30;');
+      expect(script).toContain('var toTime = 90;');
+
+      mockBridge.executeScript.mockClear();
+      mockBridge.executeScript.mockResolvedValue({ success: true, clips: [] });
+
+      await tools.executeTool('get_track_clips', {
+        sequenceId: 'seq-1',
+        trackType: 'video',
+        trackIndex: 0
+      });
+      script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var fromTime = null;');
+      expect(script).toContain('var toTime = null;');
+    });
+
+    it('passes through the filtered clip list', async () => {
+      mockBridge.executeScript.mockResolvedValue({
+        success: true,
+        trackType: 'video',
+        trackIndex: 2,
+        clipCount: 1,
+        totalClipsOnTrack: 40,
+        clips: [{ id: 'clip-5', name: 'broll.mp4', start: 30, end: 34, duration: 4, inPoint: 2, outPoint: 6 }]
+      });
+
+      const result = await tools.executeTool('get_track_clips', {
+        sequenceId: 'seq-1',
+        trackType: 'video',
+        trackIndex: 2,
+        fromTime: 29,
+        toTime: 35
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.clips).toHaveLength(1);
+      expect(result.totalClipsOnTrack).toBe(40);
     });
   });
 

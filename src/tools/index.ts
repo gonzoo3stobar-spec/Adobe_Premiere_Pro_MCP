@@ -326,11 +326,11 @@ export class PremiereProTools {
       },
       {
         name: 'move_clip',
-        description: 'Moves a clip to a different position on the timeline.',
+        description: 'Moves a clip to a different time position on its own track. Cross-track moves are NOT supported by Premiere\'s scripting API: passing a newTrackIndex that differs from the clip\'s current track fails with an explicit error instead of silently ignoring the parameter. To change tracks, use place_clip_segment for the same source range on the target track and then remove_from_timeline for the original clip.',
         inputSchema: z.object({
           clipId: z.string().describe('The ID of the clip to move'),
           newTime: z.number().describe('The new time position in seconds'),
-          newTrackIndex: z.number().optional().describe('The new track index (if moving to different track)')
+          newTrackIndex: z.number().optional().describe('Unsupported: Premiere cannot move clips across tracks via scripting. If provided and different from the current track, the call fails with a hint instead of pretending success.')
         })
       },
       {
@@ -353,12 +353,48 @@ export class PremiereProTools {
       },
       {
         name: 'razor_timeline_at_time',
-        description: 'Cuts across multiple tracks in a sequence at an absolute timeline time. If no track arrays are provided, all video and audio tracks are cut.',
+        description: 'Cuts across multiple tracks in a sequence at an absolute timeline time. Omit both track arrays to cut all video and audio tracks. When indices are provided for only one track type, the other type is left uncut (it no longer defaults to "all tracks"). Note: razoring a track that contains linked audio/video clips also cuts the linked counterpart on its own track — that is Premiere\'s linking behavior, not a track-selection bug.',
         inputSchema: z.object({
           sequenceId: z.string().optional().describe('Optional sequence ID. Defaults to the active sequence.'),
           time: z.number().describe('Absolute timeline time in seconds where the cut should occur.'),
-          videoTrackIndices: z.array(z.number().int().min(0)).optional().describe('Optional video track indices to cut. Defaults to all video tracks.'),
-          audioTrackIndices: z.array(z.number().int().min(0)).optional().describe('Optional audio track indices to cut. Defaults to all audio tracks.')
+          videoTrackIndices: z.array(z.number().int().min(0)).optional().describe('Video track indices to cut. Omit together with audioTrackIndices to cut all tracks; provide an array (even empty) to cut only the listed video tracks.'),
+          audioTrackIndices: z.array(z.number().int().min(0)).optional().describe('Audio track indices to cut. Omit together with videoTrackIndices to cut all tracks; provide an array (even empty) to cut only the listed audio tracks.')
+        })
+      },
+      {
+        name: 'place_clip_segment',
+        description: 'Places a specific source range (sourceIn to sourceOut) of a project item onto a sequence track in a single call — replaces the park-beyond-sequence-end/razor-twice/lift staging workaround. Temporarily sets in/out points on the project item, places it via overwrite or insert, then clears the points so the project panel item stays clean. Reports success only after the placed track item was found on the target track with the requested source range; the returned start/end/inPoint/outPoint are the actual frame-rounded values, so use those for follow-up edits instead of the requested ones.',
+        inputSchema: z.object({
+          sequenceId: z.string().describe('The ID of the sequence (timeline) to place the segment in'),
+          projectItemId: z.string().describe('The ID of the source project item (clip) to place'),
+          trackIndex: z.number().int().min(0).describe('Target track index (0-based)'),
+          trackType: z.enum(['video', 'audio']).optional().describe('Target track type. Defaults to "video".'),
+          time: z.number().min(0).describe('Timeline position in seconds where the segment should start'),
+          sourceIn: z.number().min(0).describe('Source in point in seconds within the source clip'),
+          sourceOut: z.number().describe('Source out point in seconds within the source clip. Must be greater than sourceIn.'),
+          insertMode: z.enum(['overwrite', 'insert']).optional().describe('Whether to overwrite existing content (default) or insert and shift the track'),
+          linkAudio: z.boolean().optional().describe('When false, removes the auto-linked audio counterpart that Premiere places on audio tracks for video clips with embedded audio. Default true.')
+        })
+      },
+      {
+        name: 'ripple_delete_range',
+        description: 'Removes a time range from ALL tracks of a sequence and shifts everything behind the range left to close the gap (multi-track ripple delete). Razors every track at both boundaries, lifts all clips inside the range, then moves all later clips left by the range duration — the whole operation runs as one ExtendScript pass, so it stays fast even with 100+ affected clips. Optionally shifts sequence markers along with the content.',
+        inputSchema: z.object({
+          sequenceId: z.string().describe('The ID of the sequence'),
+          startTime: z.number().min(0).describe('Range start in seconds (inclusive)'),
+          endTime: z.number().describe('Range end in seconds (exclusive). Must be greater than startTime.'),
+          shiftMarkers: z.boolean().optional().describe('When true (default), sequence markers at or after the range end shift left with the content and markers inside the range are clamped to the range start.')
+        })
+      },
+      {
+        name: 'get_track_clips',
+        description: 'Lists the clips of a single track, optionally limited to a time window — a lightweight alternative to list_sequence_tracks when only one track matters. Returns id, name, start, end, duration, inPoint and outPoint per clip.',
+        inputSchema: z.object({
+          sequenceId: z.string().describe('The ID of the sequence'),
+          trackType: z.enum(['video', 'audio']).describe('The type of track'),
+          trackIndex: z.number().int().min(0).describe('The track index (0-based)'),
+          fromTime: z.number().optional().describe('Only return clips that end after this time in seconds'),
+          toTime: z.number().optional().describe('Only return clips that start before this time in seconds')
         })
       },
 
@@ -1232,6 +1268,12 @@ export class PremiereProTools {
           return await this.splitClip(args.clipId, args.splitTime);
         case 'razor_timeline_at_time':
           return await this.razorTimelineAtTime(args.sequenceId, args.time, args.videoTrackIndices, args.audioTrackIndices);
+        case 'place_clip_segment':
+          return await this.placeClipSegment(args.sequenceId, args.projectItemId, args.trackIndex, args.trackType, args.time, args.sourceIn, args.sourceOut, args.insertMode, args.linkAudio);
+        case 'ripple_delete_range':
+          return await this.rippleDeleteRange(args.sequenceId, args.startTime, args.endTime, args.shiftMarkers);
+        case 'get_track_clips':
+          return await this.getTrackClips(args.sequenceId, args.trackType, args.trackIndex, args.fromTime, args.toTime);
 
         // Effects and Transitions
         case 'apply_effect':
@@ -2641,21 +2683,50 @@ export class PremiereProTools {
     return await this.bridge.executeScript(script);
   }
 
-  private async moveClip(clipId: string, newTime: number, _newTrackIndex?: number): Promise<any> {
+  // FIX vs earlier behavior: newTrackIndex was accepted but silently ignored (clips always
+  // stayed on their track — live-confirmed June 11, 2026). Premiere's scripting DOM has no
+  // track-move call (TrackItem.move only shifts in time), so a differing newTrackIndex now
+  // fails honestly with a pointer to place_clip_segment instead of faking success. The
+  // time-move path also verifies the clip actually landed at the requested position.
+  private async moveClip(clipId: string, newTime: number, newTrackIndex?: number): Promise<any> {
     const script = `
       try {
         var info = __findClip("${esc(clipId)}");
         if (!info) return JSON.stringify({ success: false, error: "Clip not found" });
         var clip = info.clip;
+        ${newTrackIndex !== undefined ? `
+        if (${newTrackIndex} !== info.trackIndex) {
+          return JSON.stringify({
+            success: false,
+            error: "move_clip cannot move clips across tracks: Premiere's scripting API has no track-move call (TrackItem.move only shifts in time). The clip stays on " + info.trackType + " track " + info.trackIndex + ".",
+            hint: "Use place_clip_segment to place the same source range on the target track, then remove_from_timeline for the original clip.",
+            clipId: "${esc(clipId)}",
+            trackIndex: info.trackIndex,
+            requestedTrackIndex: ${newTrackIndex}
+          });
+        }` : ''}
         var oldTime = clip.start.seconds;
         var shiftAmount = ${newTime} - oldTime;
         clip.move(shiftAmount);
+        var actualTime = clip.start.seconds;
+        if (Math.abs(actualTime - ${newTime}) > 0.1) {
+          return JSON.stringify({
+            success: false,
+            error: "Premiere did not move the clip to the requested time (the target position may be blocked by another clip)",
+            clipId: "${esc(clipId)}",
+            oldTime: oldTime,
+            requestedTime: ${newTime},
+            actualTime: actualTime,
+            trackIndex: info.trackIndex
+          });
+        }
         return JSON.stringify({
           success: true,
           message: "Clip moved successfully",
           clipId: "${esc(clipId)}",
           oldTime: oldTime,
-          newTime: ${newTime},
+          newTime: actualTime,
+          requestedTime: ${newTime},
           trackIndex: info.trackIndex
         });
       } catch (e) {
@@ -2733,8 +2804,13 @@ export class PremiereProTools {
 
   private async razorTimelineAtTime(sequenceId?: string, time?: number, videoTrackIndices?: number[], audioTrackIndices?: number[]): Promise<any> {
     const normalizedTime = time ?? 0;
-    const videoIndices = videoTrackIndices ?? [];
-    const audioIndices = audioTrackIndices ?? [];
+    // FIX vs earlier behavior: when only one track-type array was provided, the omitted
+    // type still defaulted to "cut ALL tracks" — live-confirmed June 11, 2026 as "razor
+    // ignores the track parameters". A caller restricting one type now means the other
+    // type stays uncut (null = all tracks, only when BOTH arrays are omitted).
+    const hasExplicitSelection = videoTrackIndices !== undefined || audioTrackIndices !== undefined;
+    const videoIndices = videoTrackIndices ?? (hasExplicitSelection ? [] : null);
+    const audioIndices = audioTrackIndices ?? (hasExplicitSelection ? [] : null);
 
     const script = `
       try {
@@ -2764,7 +2840,7 @@ export class PremiereProTools {
         if (!qeSeq) return JSON.stringify({ success: false, error: "QE active sequence unavailable" });
 
         function buildIndices(count, requested) {
-          if (!requested || requested.length === 0) {
+          if (requested === null) {
             var all = [];
             for (var idx = 0; idx < count; idx++) all.push(idx);
             return all;
@@ -2825,6 +2901,409 @@ export class PremiereProTools {
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: "QE DOM error: " + e.toString() });
+      }
+    `;
+
+    return await this.bridge.executeScript(script);
+  }
+
+  // Places a source range of a project item in ONE bridge call: temporary in/out points on
+  // the project item + Track.overwriteClip/insertClip, then the panel item is cleaned up
+  // again. Replaces the multi-call staging recipe (park full clip beyond the sequence end,
+  // razor twice, lift head/tail, move the middle piece) that cost 5+ roundtrips per cut.
+  private async placeClipSegment(
+    sequenceId: string,
+    projectItemId: string,
+    trackIndex: number,
+    trackType: string = 'video',
+    time: number = 0,
+    sourceIn: number = 0,
+    sourceOut: number = 0,
+    insertMode: string = 'overwrite',
+    linkAudio: boolean = true
+  ): Promise<any> {
+    if (sourceOut <= sourceIn) {
+      return {
+        success: false,
+        error: `sourceOut (${sourceOut}) must be greater than sourceIn (${sourceIn})`,
+        sourceIn,
+        sourceOut
+      };
+    }
+
+    const removeLinkedAudio = linkAudio === false && trackType === 'video';
+    const script = `
+      try {
+        var sequence = __findSequence("${esc(sequenceId)}");
+        if (!sequence) return JSON.stringify({ success: false, error: "Sequence not found by id: ${esc(sequenceId)}" });
+
+        var projectItem = __findProjectItem("${esc(projectItemId)}");
+        if (!projectItem) return JSON.stringify({ success: false, error: "Project item not found by id: ${esc(projectItemId)}" });
+
+        var tracks = ${JSON.stringify(trackType)} === "audio" ? sequence.audioTracks : sequence.videoTracks;
+        if (${trackIndex} < 0 || ${trackIndex} >= tracks.numTracks) {
+          return JSON.stringify({ success: false, error: "${esc(trackType)} track index ${trackIndex} out of range", trackCount: tracks.numTracks });
+        }
+        var track = tracks[${trackIndex}];
+
+        var fps = sequence.timebase ? (254016000000 / parseInt(sequence.timebase, 10)) : 30;
+        var tolerance = 1.5 / fps;
+
+        // Capture the panel item's current in/out so it can be restored if clearing fails.
+        var originalIn = null;
+        var originalOut = null;
+        try {
+          originalIn = projectItem.getInPoint(4).ticks;
+          originalOut = projectItem.getOutPoint(4).ticks;
+        } catch (captureErr) {}
+
+        var placeError = null;
+        try {
+          projectItem.setInPoint(__secondsToTicks(${sourceIn}), 4);
+          projectItem.setOutPoint(__secondsToTicks(${sourceOut}), 4);
+          if (${JSON.stringify(insertMode)} === "insert") {
+            track.insertClip(projectItem, ${time});
+          } else {
+            track.overwriteClip(projectItem, ${time});
+          }
+        } catch (pe) {
+          placeError = pe.toString();
+        }
+
+        // Always clean the panel item back up, even when placement failed.
+        var panelItemState = "cleared";
+        try {
+          projectItem.clearInPoint(4);
+          projectItem.clearOutPoint(4);
+        } catch (clearErr) {
+          try {
+            if (originalIn !== null) projectItem.setInPoint(originalIn, 4);
+            if (originalOut !== null) projectItem.setOutPoint(originalOut, 4);
+            panelItemState = "restored";
+          } catch (restoreErr) {
+            panelItemState = "modified";
+          }
+        }
+
+        if (placeError) {
+          return JSON.stringify({ success: false, error: "Placement failed: " + placeError, panelItemState: panelItemState });
+        }
+
+        var placedClip = null;
+        for (var i = 0; i < track.clips.numItems; i++) {
+          var candidate = track.clips[i];
+          if (candidate && candidate.projectItem && candidate.projectItem.nodeId === projectItem.nodeId && Math.abs(candidate.start.seconds - ${time}) < 0.1) {
+            placedClip = candidate;
+            break;
+          }
+        }
+
+        if (!placedClip) {
+          return JSON.stringify({
+            success: false,
+            error: "Clip placement did not produce a track item at ${time}s on ${esc(trackType)} track ${trackIndex}",
+            panelItemState: panelItemState
+          });
+        }
+
+        var expectedDuration = ${sourceOut} - ${sourceIn};
+        var inPointOk = Math.abs(placedClip.inPoint.seconds - ${sourceIn}) <= tolerance;
+        var durationOk = Math.abs(placedClip.duration.seconds - expectedDuration) <= tolerance;
+        if (!inPointOk || !durationOk) {
+          return JSON.stringify({
+            success: false,
+            error: "Track item was placed but its source range does not match the requested segment (the full clip may have been placed instead)",
+            placed: true,
+            clipId: placedClip.nodeId,
+            requestedSourceIn: ${sourceIn},
+            requestedSourceOut: ${sourceOut},
+            actualInPoint: placedClip.inPoint.seconds,
+            actualOutPoint: placedClip.outPoint.seconds,
+            actualDuration: placedClip.duration.seconds,
+            panelItemState: panelItemState
+          });
+        }
+
+        // Optional cleanup of the auto-linked audio counterpart (same protection as
+        // add_to_timeline's linkAudio=false: silent embedded PCM must not overwrite
+        // existing audio tracks).
+        var removeLinkedAudio = ${removeLinkedAudio};
+        var unlinkedAudioRemoved = 0;
+        if (removeLinkedAudio) {
+          var videoStart = placedClip.start.seconds;
+          for (var at = 0; at < sequence.audioTracks.numTracks; at++) {
+            var audioTrack = sequence.audioTracks[at];
+            for (var ai = audioTrack.clips.numItems - 1; ai >= 0; ai--) {
+              var audioClip = audioTrack.clips[ai];
+              if (audioClip && audioClip.projectItem &&
+                  audioClip.projectItem.nodeId === projectItem.nodeId &&
+                  Math.abs(audioClip.start.seconds - videoStart) < 0.1) {
+                try {
+                  audioClip.remove(false, false);
+                  unlinkedAudioRemoved++;
+                } catch (rmErr) {}
+              }
+            }
+          }
+        }
+
+        return JSON.stringify({
+          success: true,
+          message: "Clip segment placed successfully",
+          clipId: placedClip.nodeId,
+          clipName: placedClip.name,
+          sequenceId: sequence.sequenceID,
+          trackType: ${JSON.stringify(trackType)},
+          trackIndex: ${trackIndex},
+          start: placedClip.start.seconds,
+          end: placedClip.end.seconds,
+          duration: placedClip.duration.seconds,
+          inPoint: placedClip.inPoint.seconds,
+          outPoint: placedClip.outPoint.seconds,
+          requestedTime: ${time},
+          requestedSourceIn: ${sourceIn},
+          requestedSourceOut: ${sourceOut},
+          insertMode: ${JSON.stringify(insertMode)},
+          linkAudio: ${linkAudio},
+          unlinkedAudioRemoved: unlinkedAudioRemoved,
+          panelItemState: panelItemState
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: e.toString() });
+      }
+    `;
+
+    return await this.bridge.executeScript(script);
+  }
+
+  // Multi-track ripple delete in ONE bridge call: razor all tracks at both range
+  // boundaries, lift every clip inside the range, shift everything behind the range left
+  // by the range duration (ascending per track so moved clips never collide), optionally
+  // shift sequence markers. A 162-clip ripple previously needed per-clip roundtrips.
+  private async rippleDeleteRange(sequenceId: string, startTime: number, endTime: number, shiftMarkers: boolean = true): Promise<any> {
+    if (endTime <= startTime) {
+      return {
+        success: false,
+        error: `endTime (${endTime}) must be greater than startTime (${startTime})`,
+        startTime,
+        endTime
+      };
+    }
+
+    const script = `
+      try {
+        app.enableQE();
+        var sequence = __findSequence("${esc(sequenceId)}");
+        if (!sequence) return JSON.stringify({ success: false, error: "Sequence not found by id: ${esc(sequenceId)}" });
+
+        if (app.project.activeSequence && app.project.activeSequence.sequenceID !== sequence.sequenceID) {
+          app.project.openSequence(sequence.sequenceID);
+        }
+        var activeSequence = app.project.activeSequence;
+        if (!activeSequence || activeSequence.sequenceID !== sequence.sequenceID) {
+          return JSON.stringify({ success: false, error: "Unable to activate requested sequence for ripple delete" });
+        }
+
+        var startTime = ${startTime};
+        var endTime = ${endTime};
+        var delta = endTime - startTime;
+        var fps = activeSequence.timebase ? (254016000000 / parseInt(activeSequence.timebase, 10)) : 30;
+        var halfFrame = 0.5 / fps;
+
+        function toTimecode(seconds) {
+          var totalFrames = Math.round(seconds * fps);
+          var hours = Math.floor(totalFrames / (fps * 3600));
+          var mins = Math.floor((totalFrames % (fps * 3600)) / (fps * 60));
+          var secs = Math.floor((totalFrames % (fps * 60)) / fps);
+          var frames = Math.round(totalFrames % fps);
+          function pad(n) { return n < 10 ? "0" + n : "" + n; }
+          return pad(hours) + ":" + pad(mins) + ":" + pad(secs) + ":" + pad(frames);
+        }
+
+        var qeSeq = qe.project.getActiveSequence();
+        if (!qeSeq) return JSON.stringify({ success: false, error: "QE active sequence unavailable" });
+
+        function razorAll(tc) {
+          for (var v = 0; v < activeSequence.videoTracks.numTracks; v++) {
+            var qv = qeSeq.getVideoTrackAt(v);
+            if (qv) { try { qv.razor(tc); } catch (razorErr) {} }
+          }
+          for (var a = 0; a < activeSequence.audioTracks.numTracks; a++) {
+            var qa = qeSeq.getAudioTrackAt(a);
+            if (qa) { try { qa.razor(tc); } catch (razorErr) {} }
+          }
+        }
+        razorAll(toTimecode(startTime));
+        razorAll(toTimecode(endTime));
+
+        var removedClips = 0;
+        var shiftedClips = 0;
+        var problems = [];
+
+        function processTracks(tracks, trackLabel) {
+          for (var t = 0; t < tracks.numTracks; t++) {
+            var track = tracks[t];
+
+            // Remove everything fully inside the range. Iterate backwards because
+            // remove() reindexes the collection; linked counterparts may already be
+            // gone, so stale references are skipped via try/catch.
+            for (var c = track.clips.numItems - 1; c >= 0; c--) {
+              var clip = track.clips[c];
+              if (!clip) continue;
+              var cs, ce;
+              try { cs = clip.start.seconds; ce = clip.end.seconds; } catch (staleErr) { continue; }
+              if (cs >= startTime - halfFrame && ce <= endTime + halfFrame) {
+                try {
+                  clip.remove(false, false);
+                  removedClips++;
+                } catch (rmErr) {
+                  problems.push({ track: trackLabel + t, start: cs, reason: "remove failed: " + rmErr.toString() });
+                }
+              } else if ((cs < startTime - halfFrame && ce > startTime + halfFrame) || (cs < endTime - halfFrame && ce > endTime + halfFrame)) {
+                problems.push({ track: trackLabel + t, start: cs, end: ce, reason: "clip still spans a range boundary (razor failed — locked track?)" });
+              }
+            }
+
+            // Shift everything behind the range left. Collect first, then move in
+            // ascending start order so a clip never collides with one ahead of it.
+            var toShift = [];
+            for (var s = 0; s < track.clips.numItems; s++) {
+              var sclip = track.clips[s];
+              if (!sclip) continue;
+              var ss;
+              try { ss = sclip.start.seconds; } catch (staleErr2) { continue; }
+              if (ss >= endTime - halfFrame) toShift.push({ clip: sclip, start: ss });
+            }
+            toShift.sort(function (x, y) { return x.start - y.start; });
+            for (var m = 0; m < toShift.length; m++) {
+              try {
+                toShift[m].clip.move(-delta);
+                shiftedClips++;
+              } catch (mvErr) {
+                problems.push({ track: trackLabel + t, start: toShift[m].start, reason: "move failed: " + mvErr.toString() });
+              }
+            }
+          }
+        }
+        processTracks(activeSequence.videoTracks, "V");
+        processTracks(activeSequence.audioTracks, "A");
+
+        var shiftMarkersEnabled = ${shiftMarkers !== false};
+        var shiftedMarkers = 0;
+        var clampedMarkers = 0;
+        if (shiftMarkersEnabled) {
+          // Snapshot the marker references first: changing start times during an
+          // index-based iteration can resort the collection and skip markers.
+          var markerList = [];
+          for (var mk = 0; mk < activeSequence.markers.numMarkers; mk++) {
+            markerList.push(activeSequence.markers[mk]);
+          }
+          for (var ml = 0; ml < markerList.length; ml++) {
+            var marker = markerList[ml];
+            var mStart = marker.start.seconds;
+            var mDuration = marker.end.seconds - mStart;
+            if (mStart >= endTime - halfFrame) {
+              marker.start = mStart - delta;
+              marker.end = (mStart - delta) + mDuration;
+              shiftedMarkers++;
+            } else if (mStart >= startTime - halfFrame) {
+              marker.start = startTime;
+              marker.end = startTime + mDuration;
+              clampedMarkers++;
+            }
+          }
+        }
+
+        if (problems.length > 0) {
+          return JSON.stringify({
+            success: false,
+            error: "Ripple delete only partially applied — the timeline may be in an inconsistent state. Use the undo tool to roll back.",
+            problems: problems,
+            removedClips: removedClips,
+            shiftedClips: shiftedClips,
+            shiftedMarkers: shiftedMarkers,
+            clampedMarkers: clampedMarkers,
+            startTime: startTime,
+            endTime: endTime,
+            delta: delta
+          });
+        }
+
+        return JSON.stringify({
+          success: true,
+          message: "Removed " + delta + "s range across all tracks and closed the gap",
+          sequenceId: activeSequence.sequenceID,
+          sequenceName: activeSequence.name,
+          startTime: startTime,
+          endTime: endTime,
+          delta: delta,
+          removedClips: removedClips,
+          shiftedClips: shiftedClips,
+          shiftedMarkers: shiftedMarkers,
+          clampedMarkers: clampedMarkers,
+          sequenceEnd: __ticksToSeconds(activeSequence.end)
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: e.toString() });
+      }
+    `;
+
+    return await this.bridge.executeScript(script);
+  }
+
+  // Filtered single-track clip listing — list_sequence_tracks dumps every clip of every
+  // track (70+ KB on real edits), which is wasteful when the caller only needs one track
+  // or one time window.
+  private async getTrackClips(sequenceId: string, trackType: string, trackIndex: number, fromTime?: number, toTime?: number): Promise<any> {
+    const script = `
+      try {
+        var sequence = __findSequence("${esc(sequenceId)}");
+        if (!sequence) return JSON.stringify({ success: false, error: "Sequence not found by id: ${esc(sequenceId)}" });
+
+        var tracks = ${JSON.stringify(trackType)} === "audio" ? sequence.audioTracks : sequence.videoTracks;
+        if (${trackIndex} < 0 || ${trackIndex} >= tracks.numTracks) {
+          return JSON.stringify({ success: false, error: "${esc(trackType)} track index ${trackIndex} out of range", trackCount: tracks.numTracks });
+        }
+        var track = tracks[${trackIndex}];
+
+        var fromTime = ${fromTime !== undefined ? fromTime : 'null'};
+        var toTime = ${toTime !== undefined ? toTime : 'null'};
+
+        var clips = [];
+        for (var i = 0; i < track.clips.numItems; i++) {
+          var clip = track.clips[i];
+          if (!clip) continue;
+          var cs = clip.start.seconds;
+          var ce = clip.end.seconds;
+          if (fromTime !== null && ce <= fromTime) continue;
+          if (toTime !== null && cs >= toTime) continue;
+          clips.push({
+            id: clip.nodeId,
+            name: clip.name,
+            start: cs,
+            end: ce,
+            duration: clip.duration.seconds,
+            inPoint: clip.inPoint.seconds,
+            outPoint: clip.outPoint.seconds,
+            clipIndex: i
+          });
+        }
+
+        return JSON.stringify({
+          success: true,
+          sequenceId: sequence.sequenceID,
+          sequenceName: sequence.name,
+          trackType: ${JSON.stringify(trackType)},
+          trackIndex: ${trackIndex},
+          trackName: track.name || (${JSON.stringify(trackType)} === "audio" ? "Audio " : "Video ") + (${trackIndex} + 1),
+          fromTime: fromTime,
+          toTime: toTime,
+          clipCount: clips.length,
+          totalClipsOnTrack: track.clips.numItems,
+          clips: clips
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: e.toString() });
       }
     `;
 

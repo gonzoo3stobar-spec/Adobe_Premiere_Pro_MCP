@@ -266,6 +266,11 @@ async function main() {
       trackIndex: 0,
       time: 1,
     });
+    sampleArgs.set('get_track_clips', {
+      sequenceId: demoSequenceId,
+      trackType: 'video',
+      trackIndex: 0,
+    });
   }
 
   if (demoClipId) {
@@ -304,6 +309,26 @@ async function main() {
     sampleArgs.set('get_color_label', { projectItemId: demoProjectItemId });
     sampleArgs.set('get_metadata', { projectItemId: demoProjectItemId });
     sampleArgs.set('get_footage_interpretation', { projectItemId: demoProjectItemId });
+  }
+
+  if (demoSequenceId && demoProjectItemId) {
+    // Mutates only the disposable Sweep demo sequence. place_clip_segment runs before
+    // ripple_delete_range (Map preserves insertion order) so the ripple has content
+    // beyond its range to shift left.
+    sampleArgs.set('place_clip_segment', {
+      sequenceId: demoSequenceId,
+      projectItemId: demoProjectItemId,
+      trackIndex: 0,
+      trackType: 'video',
+      time: 30,
+      sourceIn: 0.5,
+      sourceOut: 1.5,
+    });
+    sampleArgs.set('ripple_delete_range', {
+      sequenceId: demoSequenceId,
+      startTime: 20,
+      endTime: 21,
+    });
   }
 
   if (firstAssetName) {
